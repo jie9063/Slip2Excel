@@ -212,6 +212,31 @@ class BookkeepingLogicTests(unittest.TestCase):
         self.assertEqual(app.progress_var.value, 1)
         show_info.assert_called_once()
 
+    def test_reading_state_does_not_change_global_mouse_cursor(self):
+        class FakeWidget:
+            def __init__(self):
+                self.calls = []
+
+            def configure(self, **kwargs):
+                self.calls.append(kwargs)
+
+        class FakeRoot:
+            def config(self, **_kwargs):
+                raise AssertionError("背景讀取不應改變全域滑鼠游標")
+
+        app = object.__new__(BookkeepingApp)
+        app.read_button = FakeWidget()
+        app.cancel_button = FakeWidget()
+        app.clear_button = FakeWidget()
+        app.write_button = FakeWidget()
+        app.root = FakeRoot()
+
+        app._set_reading_state(True)
+
+        self.assertTrue(app.reading)
+        self.assertEqual(app.read_button.calls[-1], {"state": "disabled"})
+        self.assertEqual(app.cancel_button.calls[-1], {"state": "normal"})
+
 
 class XlsxWriterTests(unittest.TestCase):
     def test_writes_numbers_preserves_formula_and_sets_recalculation(self):

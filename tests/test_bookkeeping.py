@@ -1,10 +1,13 @@
 import datetime as dt
+import queue
 import sys
 import tempfile
+import threading
 import unittest
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -17,6 +20,7 @@ from bookkeeping import (  # noqa: E402
     XlsxWriter,
     parse_date,
     prepare_entries,
+    read_photos_worker,
 )
 
 
@@ -129,6 +133,84 @@ class BookkeepingLogicTests(unittest.TestCase):
         app.show_issue_detail()
         self.assertIn("partial.jpg", app.issue_detail.value)
         self.assertIn("missing price", app.issue_detail.value)
+
+    def test_background_worker_reports_receipts_without_tkinter(self):
+        class FakeReader:
+            def __init__(self, model):
+                self.model = model
+
+            def check_ready(self):
+                pass
+
+            def read(self, photo):
+                return Receipt(photo.name, "客戶A", "8/8", [Item("", 1, 2, 1)], [])
+
+        events = queue.Queue()
+        with patch("bookkeeping.LocalVisionReader", FakeReader):
+            read_photos_worker([Path("one.jpg"), Path("two.jpg")], "model", events, threading.Event())
+        received = [events.get_nowait() for _ in range(events.qsize())]
+        self.assertEqual([event[0] for event in received], ["receipt", "receipt", "finished"])
+        self.assertEqual(received[0][3].file, "one.jpg")
+
+    def test_background_worker_honours_cancel_before_next_photo(self):
+        class FakeReader:
+            def __init__(self, _model):
+                pass
+
+            def check_ready(self):
+                pass
+
+            def read(self, _photo):
+                raise AssertionError("cancelled work must not read a photo")
+
+        events, cancel = queue.Queue(), threading.Event()
+        cancel.set()
+        with patch("bookkeeping.LocalVisionReader", FakeReader):
+            read_photos_worker([Path("one.jpg")], "model", events, cancel)
+        event = events.get_nowait()
+        self.assertEqual(event[0], "cancelled")
+        self.assertEqual(event[1:], (0, 1))
+
+    def test_polling_updates_ui_from_background_events(self):
+        class FakeValue:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+
+        class FakeWidget:
+            def __init__(self):
+                self.calls = []
+
+            def configure(self, **kwargs):
+                self.calls.append(kwargs)
+
+        class FakeRoot(FakeWidget):
+            def config(self, **kwargs):
+                self.calls.append(kwargs)
+
+            def after(self, *_args):
+                raise AssertionError("polling should finish without another callback")
+
+        app = object.__new__(BookkeepingApp)
+        app.reading = True
+        app.read_events = queue.Queue()
+        app.cancel_reading_event = threading.Event()
+        app.receipts = []
+        app.progress_var, app.progress_text = FakeValue(), FakeValue()
+        app.read_button = app.cancel_button = app.clear_button = app.write_button = FakeWidget()
+        app.root = FakeRoot()
+        app.refresh_receipts = lambda: None
+        app.validate = lambda receipt: None
+        app.read_events.put(("receipt", 1, 1, Receipt("one.jpg", "客戶A", "8/8", [], [])))
+        app.read_events.put(("finished", 1, 1))
+        with patch("bookkeeping.messagebox.showinfo") as show_info:
+            app._poll_read_events()
+        self.assertFalse(app.reading)
+        self.assertEqual(len(app.receipts), 1)
+        self.assertEqual(app.progress_var.value, 1)
+        show_info.assert_called_once()
 
 
 class XlsxWriterTests(unittest.TestCase):

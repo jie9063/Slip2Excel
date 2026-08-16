@@ -8,14 +8,16 @@ import datetime as dt
 import json
 import logging
 import math
+import queue
 import re
 import shutil
 import tempfile
+import threading
 import tkinter as tk
 import urllib.error
 import urllib.request
 import zipfile
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from xml.etree import ElementTree as ET
@@ -495,12 +497,40 @@ line 必須是單據左側印出的列號（1 到 17），不可自行編號。�
         raise ValueError
 
 
+def read_photos_worker(
+    photos: list[Path], model: str, events: queue.Queue, cancel_event: threading.Event,
+) -> None:
+    """Read photos off the Tkinter thread and report only plain data events."""
+    total = len(photos)
+    try:
+        reader = LocalVisionReader(model)
+        reader.check_ready()
+    except Exception as error:
+        events.put(("fatal", str(error)))
+        return
+
+    for index, photo in enumerate(photos, start=1):
+        if cancel_event.is_set():
+            events.put(("cancelled", index - 1, total))
+            return
+        try:
+            receipt = reader.read(photo)
+        except Exception as error:
+            logging.exception("照片讀取失敗：%s", photo.name)
+            receipt = Receipt(photo.name, "", "", [], [str(error)])
+        events.put(("receipt", index, total, receipt))
+    events.put(("finished", total, total))
+
+
 class BookkeepingApp:
     def __init__(self):
         self.config = load_config()
         self.receipts: list[Receipt] = []
+        self.reading = False
+        self.read_events: queue.Queue = queue.Queue()
+        self.cancel_reading_event = threading.Event()
         self.root = tk.Tk()
-        self.root.title("Slip2Excel")
+        self.root.title("手寫單據自動記帳")
         self.root.geometry("1050x720")
         self.root.minsize(900, 620)
         self._build()
@@ -531,9 +561,14 @@ class BookkeepingApp:
     def _build_process(self):
         top = ttk.Frame(self.process_tab)
         top.pack(fill="x")
-        ttk.Button(top, text="讀取照片資料夾", command=self.analyse_photos).pack(side="left")
-        ttk.Button(top, text="清除本次結果", command=self.clear_receipts).pack(side="left")
-        ttk.Button(top, text="寫入 Excel", command=self.write_excel).pack(side="right")
+        self.read_button = ttk.Button(top, text="讀取照片資料夾", command=self.analyse_photos)
+        self.read_button.pack(side="left")
+        self.cancel_button = ttk.Button(top, text="取消讀取", command=self.cancel_reading, state="disabled")
+        self.cancel_button.pack(side="left", padx=(8, 0))
+        self.clear_button = ttk.Button(top, text="清除本次結果", command=self.clear_receipts)
+        self.clear_button.pack(side="left", padx=(8, 0))
+        self.write_button = ttk.Button(top, text="寫入 Excel", command=self.write_excel)
+        self.write_button.pack(side="right")
         progress_row = ttk.Frame(self.process_tab)
         progress_row.pack(fill="x", pady=(10, 0))
         self.progress_var = tk.IntVar(value=0)
@@ -674,38 +709,80 @@ class BookkeepingApp:
         save_config(self.config); self.refresh_mapping()
 
     def analyse_photos(self):
+        if self.reading:
+            return
         self.save_settings()
         folder = Path(self.config["photo_folder"])
         photos = sorted([p for p in folder.glob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"}]) if folder.exists() else []
         if not photos:
             messagebox.showwarning("沒有照片", "找不到 JPG 或 PNG 照片，請檢查原始照片資料夾。"); return
-        reader = LocalVisionReader(self.config["local_model"])
-        try:
-            reader.check_ready()
-        except RuntimeError as error:
-            messagebox.showwarning("無法讀取照片", str(error))
-            return
         self.receipts = []
         self.progress_bar.configure(maximum=len(photos))
         self.progress_var.set(0)
         self.progress_text.set(f"讀取中：0 / {len(photos)}")
-        self.root.config(cursor="watch"); self.root.update()
-        for index, photo in enumerate(photos, start=1):
-            try:
-                receipt = reader.read(photo)
-            except Exception as error:
-                logging.exception("照片讀取失敗：%s", photo.name)
-                receipt = Receipt(photo.name, "", "", [], [str(error)])
-            self.validate(receipt)
-            self.receipts.append(receipt)
-            self.progress_var.set(index)
-            self.progress_text.set(f"讀取中：{index} / {len(photos)}")
-            self.refresh_receipts(); self.root.update()
-        self.root.config(cursor="")
         self.refresh_receipts()
-        valid = sum(not item.problems for item in self.receipts)
-        self.progress_text.set(f"讀取完成：{len(photos)} / {len(photos)}")
-        messagebox.showinfo("讀取完成", f"共讀取 {len(self.receipts)} 張照片；{valid} 張可寫入，其他請查看結果與 log。")
+        self.read_events = queue.Queue()
+        self.cancel_reading_event = threading.Event()
+        self._set_reading_state(True)
+        worker = threading.Thread(
+            target=read_photos_worker,
+            args=(photos, self.config["local_model"], self.read_events, self.cancel_reading_event),
+            daemon=True,
+        )
+        worker.start()
+        self.root.after(80, self._poll_read_events)
+
+    def _set_reading_state(self, reading: bool):
+        self.reading = reading
+        self.read_button.configure(state="disabled" if reading else "normal")
+        self.cancel_button.configure(state="normal" if reading else "disabled")
+        self.clear_button.configure(state="disabled" if reading else "normal")
+        self.write_button.configure(state="disabled" if reading else "normal")
+        self.root.config(cursor="watch" if reading else "")
+
+    def cancel_reading(self):
+        if not self.reading:
+            return
+        self.cancel_reading_event.set()
+        self.cancel_button.configure(state="disabled")
+        self.progress_text.set("正在取消；目前照片完成後會停止")
+
+    def _poll_read_events(self):
+        finished = False
+        while True:
+            try:
+                event = self.read_events.get_nowait()
+            except queue.Empty:
+                break
+            kind = event[0]
+            if kind == "receipt":
+                _, index, total, receipt = event
+                self.validate(receipt)
+                self.receipts.append(receipt)
+                self.progress_var.set(index)
+                self.progress_text.set(f"讀取中：{index} / {total}")
+                self.refresh_receipts()
+            elif kind == "fatal":
+                self._finish_reading("無法讀取照片", event[1])
+                finished = True
+            elif kind == "cancelled":
+                _, completed, total = event
+                self._finish_reading("已取消讀取", f"已完成 {completed} / {total} 張照片。")
+                finished = True
+            elif kind == "finished":
+                _, completed, total = event
+                valid = sum(not item.problems for item in self.receipts)
+                self.progress_var.set(completed)
+                self.progress_text.set(f"讀取完成：{completed} / {total}")
+                self._finish_reading("讀取完成", f"共讀取 {completed} 張照片；{valid} 張可寫入。\n\n有問題的照片請到「辨識問題」查看。")
+                finished = True
+        if self.reading and not finished:
+            self.root.after(80, self._poll_read_events)
+
+    def _finish_reading(self, title: str, message: str):
+        self._set_reading_state(False)
+        self.refresh_receipts()
+        messagebox.showinfo(title, message) if title != "無法讀取照片" else messagebox.showwarning(title, message)
 
     def validate(self, receipt: Receipt):
         if receipt.problems: return
@@ -807,6 +884,8 @@ class BookkeepingApp:
         self.detail.delete("1.0", "end"); self.detail.insert("1.0", "end", "\n".join(lines))
 
     def clear_receipts(self):
+        if self.reading:
+            return
         self.receipts = []
         self.progress_var.set(0)
         self.progress_bar.configure(maximum=1)
@@ -815,6 +894,9 @@ class BookkeepingApp:
         self.detail.delete("1.0", "end")
 
     def write_excel(self):
+        if self.reading:
+            messagebox.showwarning("讀取進行中", "請等待照片讀取完成後再寫入 Excel。")
+            return
         valid = [receipt for receipt in self.receipts if not receipt.problems]
         if not valid:
             messagebox.showwarning("沒有可寫入資料", "請先讀取照片，並處理所有缺少品項或日期問題。"); return

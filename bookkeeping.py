@@ -8,6 +8,8 @@ import datetime as dt
 import json
 import logging
 import math
+import mimetypes
+import os
 import queue
 import re
 import shutil
@@ -15,6 +17,7 @@ import tempfile
 import threading
 import tkinter as tk
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -40,7 +43,9 @@ DEFAULT_CONFIG = {
     "photo_folder": str(ROOT / "TrainPhoto"),
     "template_file": str(ROOT / "繼民客戶11508應收帳款(空白表單).xlsx"),
     "output_file": str(ROOT / "應收帳款_已填寫.xlsx"),
+    "vision_provider": "ollama",
     "local_model": "qwen2.5vl:7b",
+    "openai_model": "gpt-4o",
     "customers": [],
     "products": [],
 }
@@ -449,7 +454,7 @@ line 必須是單據左側印出的列號（1 到 17），不可自行編號。�
                     raise ValueError("品項必須是 JSON 物件")
                 name = str(raw.get("name", "")).strip()
                 # 模型偶爾把空白列的序號（13、14…）誤當成品名，直接捨棄。
-                if not name or name.isdigit() or raw.get("quantity") is None or raw.get("price") is None:
+                if raw.get("quantity") is None or raw.get("price") is None:
                     raise ValueError
                 line_value = float(raw.get("line", index))
                 if not line_value.is_integer():
@@ -497,13 +502,108 @@ line 必須是單據左側印出的列號（1 到 17），不可自行編號。�
         raise ValueError
 
 
+class OpenAIVisionReader(LocalVisionReader):
+    """Read a receipt photo through OpenAI's Responses API.
+
+    The key is deliberately supplied at runtime instead of being saved to config.json.
+    """
+
+    API_URL = "https://api.openai.com/v1/responses"
+    PROMPT = (
+        "Read this handwritten accounting form. Return its customer name, date, and "
+        "each filled item line's quantity and unit price. The item name is optional. "
+        "Use the line number printed on the form (1 through 17). Do not invent values."
+    )
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "customer": {"type": "string"},
+            "date": {"type": "string"},
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "line": {"type": "integer"},
+                        "name": {"type": "string"},
+                        "quantity": {"type": "number"},
+                        "price": {"type": "number"},
+                    },
+                    "required": ["line", "name", "quantity", "price"],
+                },
+            },
+        },
+        "required": ["customer", "date", "items"],
+    }
+
+    def __init__(self, model: str, api_key: str = ""):
+        super().__init__(model)
+        self.api_key = api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+
+    def _request(self, url: str, *, data: bytes | None = None, method: str = "POST") -> dict:
+        if not self.api_key:
+            raise RuntimeError("尚未輸入 OpenAI API 金鑰。請在設定頁貼上金鑰，或設定 OPENAI_API_KEY 環境變數。")
+        request = urllib.request.Request(
+            url, data=data,
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenAI API 請求失敗（{error.code}）：{detail[:300]}") from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"無法連線至 OpenAI API：{error.reason}") from error
+
+    def check_ready(self) -> None:
+        if not self.model:
+            raise RuntimeError("請填寫 OpenAI 視覺模型名稱。")
+        self._request(
+            f"https://api.openai.com/v1/models/{urllib.parse.quote(self.model, safe='')}", method="GET"
+        )
+
+    def read(self, photo: Path) -> Receipt:
+        mime_type = mimetypes.guess_type(photo.name)[0] or "image/jpeg"
+        encoded = base64.b64encode(photo.read_bytes()).decode("ascii")
+        body = {
+            "model": self.model,
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": self.PROMPT},
+                    {"type": "input_image", "image_url": f"data:{mime_type};base64,{encoded}", "detail": "high"},
+                ],
+            }],
+            "text": {
+                "format": {"type": "json_schema", "name": "receipt", "strict": True, "schema": self.RESPONSE_SCHEMA}
+            },
+        }
+        response = self._request(self.API_URL, data=json.dumps(body).encode("utf-8"))
+        for output in response.get("output", []):
+            for content in output.get("content", []):
+                if content.get("type") == "output_text" and content.get("text", "").strip():
+                    return self.from_json(content["text"], photo.name)
+        raise ValueError("OpenAI 未回傳可讀取的辨識結果。")
+
+
+def create_vision_reader(provider: str, model: str, api_key: str = "") -> LocalVisionReader:
+    if provider == "openai":
+        return OpenAIVisionReader(model, api_key)
+    return LocalVisionReader(model)
+
+
 def read_photos_worker(
     photos: list[Path], model: str, events: queue.Queue, cancel_event: threading.Event,
+    provider: str = "ollama", api_key: str = "",
 ) -> None:
     """Read photos off the Tkinter thread and report only plain data events."""
     total = len(photos)
     try:
-        reader = LocalVisionReader(model)
+        reader = create_vision_reader(provider, model, api_key)
         reader.check_ready()
     except Exception as error:
         events.put(("fatal", str(error)))
@@ -639,11 +739,27 @@ class BookkeepingApp:
         ttk.Label(self.mapping_tab, text="這裡只顯示讀取失敗或有不完整項目的照片。點選照片可查看原因；完整可寫入的照片不會顯示。", style="Hint.TLabel").pack(anchor="w", pady=(8, 0))
 
     def _build_settings(self):
-        self.settings_vars = {key: tk.StringVar(value=str(self.config[key])) for key in ("photo_folder", "template_file", "output_file", "local_model")}
+        self.settings_vars = {
+            key: tk.StringVar(value=str(self.config[key]))
+            for key in ("photo_folder", "template_file", "output_file", "vision_provider", "local_model", "openai_model")
+        }
+        self.openai_api_key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
         grid = ttk.Frame(self.settings_tab, padding=16, style="Surface.TFrame")
         grid.pack(fill="x")
+        ttk.Label(grid, text="辨識服務", style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=7)
+        provider_box = ttk.Combobox(
+            grid, textvariable=self.settings_vars["vision_provider"], state="readonly",
+            values=("ollama", "openai"), width=20,
+        )
+        provider_box.grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(grid, text="ollama 為免費離線；openai 會使用 API 額度", style="Surface.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Label(grid, text="OpenAI 視覺模型", style="Surface.TLabel").grid(row=1, column=0, sticky="w", pady=7)
+        ttk.Entry(grid, textvariable=self.settings_vars["openai_model"], width=75).grid(row=1, column=1, sticky="ew", padx=8)
+        ttk.Label(grid, text="OpenAI API 金鑰", style="Surface.TLabel").grid(row=2, column=0, sticky="w", pady=7)
+        ttk.Entry(grid, textvariable=self.openai_api_key_var, show="●", width=75).grid(row=2, column=1, sticky="ew", padx=8)
+        ttk.Label(grid, text="只在本次開啟程式期間使用，不會儲存", style="Surface.TLabel").grid(row=2, column=2, sticky="w")
         labels = [("photo_folder", "原始照片資料夾"), ("template_file", "空白 Excel 表單"), ("output_file", "完成 Excel 儲存位置"), ("local_model", "本機視覺模型")]
-        for row, (key, label) in enumerate(labels):
+        for row, (key, label) in enumerate(labels, start=3):
             ttk.Label(grid, text=label, style="Surface.TLabel").grid(row=row, column=0, sticky="w", pady=7)
             ttk.Entry(grid, textvariable=self.settings_vars[key], width=75).grid(row=row, column=1, sticky="ew", padx=8)
             if key != "local_model":
@@ -671,6 +787,17 @@ class BookkeepingApp:
         save_config(self.config)
 
     def check_local_model(self):
+        """Check the provider currently selected in Settings."""
+        self.save_settings()
+        provider = self.config["vision_provider"]
+        model = self.config["openai_model"] if provider == "openai" else self.config["local_model"]
+        try:
+            create_vision_reader(provider, model, self.openai_api_key_var.get()).check_ready()
+        except RuntimeError as error:
+            messagebox.showwarning("模型無法使用", str(error))
+        else:
+            messagebox.showinfo("模型可使用", f"已確認 {provider} 的模型 {model} 可以使用。")
+        return
         self.save_settings()
         try:
             LocalVisionReader(self.config["local_model"]).check_ready()
@@ -754,9 +881,11 @@ class BookkeepingApp:
         self.read_events = queue.Queue()
         self.cancel_reading_event = threading.Event()
         self._set_reading_state(True)
+        provider = self.config["vision_provider"]
+        model = self.config["openai_model"] if provider == "openai" else self.config["local_model"]
         worker = threading.Thread(
             target=read_photos_worker,
-            args=(photos, self.config["local_model"], self.read_events, self.cancel_reading_event),
+            args=(photos, model, self.read_events, self.cancel_reading_event, provider, self.openai_api_key_var.get()),
             daemon=True,
         )
         worker.start()

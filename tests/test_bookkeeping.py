@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import queue
 import sys
 import tempfile
@@ -15,11 +16,13 @@ from bookkeeping import (  # noqa: E402
     BookkeepingApp,
     Item,
     LocalVisionReader,
+    OpenAIVisionReader,
     NS_MAIN,
     Receipt,
     XlsxWriter,
     parse_date,
     prepare_entries,
+    create_vision_reader,
     read_photos_worker,
 )
 
@@ -133,6 +136,44 @@ class BookkeepingLogicTests(unittest.TestCase):
         app.show_issue_detail()
         self.assertIn("partial.jpg", app.issue_detail.value)
         self.assertIn("missing price", app.issue_detail.value)
+
+    def test_openai_reader_sends_image_and_reads_structured_response(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "output": [{"content": [{"type": "output_text", "text": json.dumps({
+                        "customer": "客戶A", "date": "8/8",
+                        "items": [{"line": 1, "name": "", "quantity": 2, "price": 70}],
+                    })}]}]
+                }).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            photo = Path(directory) / "receipt.jpg"
+            photo.write_bytes(b"test-image")
+            with patch("bookkeeping.urllib.request.urlopen", return_value=FakeResponse()) as open_url:
+                receipt = OpenAIVisionReader("gpt-4o", "test-key").read(photo)
+
+        request = open_url.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request.full_url, "https://api.openai.com/v1/responses")
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+        self.assertEqual(body["model"], "gpt-4o")
+        self.assertTrue(body["input"][0]["content"][1]["image_url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(receipt.customer, "客戶A")
+        self.assertEqual(receipt.items[0].price, 70)
+
+    def test_openai_reader_requires_key_and_factory_uses_selected_provider(self):
+        with patch.dict("bookkeeping.os.environ", {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "API 金鑰"):
+                OpenAIVisionReader("gpt-4o").check_ready()
+        self.assertIsInstance(create_vision_reader("ollama", "qwen2.5vl:7b"), LocalVisionReader)
+        self.assertIsInstance(create_vision_reader("openai", "gpt-4o", "key"), OpenAIVisionReader)
 
     def test_background_worker_reports_receipts_without_tkinter(self):
         class FakeReader:

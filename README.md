@@ -22,4 +22,15 @@
 - Ollama
 - 模型：`qwen2.5vl:7b`
 
+## 測試
+
+開發修改後可執行：
+
+```powershell
+python -m py_compile main.py bookkeeping.py tests\test_bookkeeping.py
+python -m unittest discover -s tests -v
+```
+
+測試會驗證日期與數字解析、重複資料處理、辨識問題清單，以及 Excel 寫入失敗時不覆蓋既有完成檔。實際發行前也應以 Microsoft Excel 開啟暫存輸出檔，確認公式已重新計算。
+
 `TrainPhoto/`、`config.json`、Excel 檔與 `logs/` 均為使用者本機資料，已排除在 Git 版本控制之外。

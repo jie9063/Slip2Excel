@@ -7,13 +7,15 @@ import copy
 import datetime as dt
 import json
 import logging
+import math
 import re
 import shutil
+import tempfile
 import tkinter as tk
 import urllib.error
 import urllib.request
 import zipfile
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from xml.etree import ElementTree as ET
@@ -57,11 +59,7 @@ class Receipt:
     date: str
     items: list[Item]
     problems: list[str]
-    warnings: list[str] = None
-
-    def __post_init__(self):
-        if self.warnings is None:
-            self.warnings = []
+    warnings: list[str] = field(default_factory=list)
 
 
 def load_config() -> dict:
@@ -148,7 +146,12 @@ def parse_date(value: str) -> dt.date:
     if len(parts) > 3 and 1 <= parts[-2] <= 12 and 1 <= parts[-1] <= 31:
         return dt.date(today.year, parts[-2], parts[-1])
     if len(parts) == 3:
-        year, month, day = parts
+        if parts[0] >= 100:
+            year, month, day = parts
+        elif parts[2] >= 100:
+            month, day, year = parts
+        else:
+            raise ValueError("三段日期請使用 115/8/8、2026/8/8 或 8/8/2026 格式")
         if year < 1911:  # 民國年
             year += 1911
         return dt.date(year, month, day)
@@ -190,83 +193,75 @@ class XlsxWriter:
         if not self.template.exists():
             raise FileNotFoundError(f"找不到空白表單：{self.template}")
         self.output.parent.mkdir(parents=True, exist_ok=True)
-        # 首次由空白表單建立；日後沿用完成檔，避免每天作業覆蓋掉先前帳務。
         if self.template.resolve() == self.output.resolve():
             raise ValueError("完成檔不能與空白 Excel 表單設定為同一個檔案。")
-        # 每次從空白表單建立新完成檔，避免上次匯出的資料造成衝突。
-        shutil.copy2(self.template, self.output)
-        with zipfile.ZipFile(self.output, "r") as source:
-            files = {info.filename: source.read(info.filename) for info in source.infolist()}
+        # 在同一資料夾先建立暫存檔，全部驗證與寫入成功後才取代完成檔。
+        # 任何中途錯誤都不會破壞既有完成檔。
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{self.output.stem}-", suffix=self.output.suffix,
+            dir=self.output.parent, delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        try:
+            shutil.copy2(self.template, temporary)
+            with zipfile.ZipFile(temporary, "r") as source:
+                files = {info.filename: source.read(info.filename) for info in source.infolist()}
 
         # Do not serialize workbook.xml with ElementTree: the template contains
         # Office extension namespaces whose original prefixes must be preserved.
-        workbook_xml = files["xl/workbook.xml"].decode("utf-8")
-        workbook = ET.fromstring(workbook_xml)
-        sheet_renames = sheet_renames or {}
-        existing_names = {sheet.attrib["name"] for sheet in workbook.findall(f".//{{{NS_MAIN}}}sheet")}
-        for sheet in workbook.findall(f".//{{{NS_MAIN}}}sheet"):
-            original = sheet.attrib["name"]
-            target = sheet_renames.get(original)
-            if target and target not in existing_names:
-                safe_original = re.escape(original)
-                safe_target = (target.replace("&", "&amp;").replace('"', "&quot;")
-                                      .replace("<", "&lt;").replace(">", "&gt;"))
-                workbook_xml, count = re.subn(
-                    rf'(<sheet\b[^>]*\bname="){safe_original}(")',
-                    rf'\g<1>{safe_target}\g<2>', workbook_xml, count=1,
-                )
-                if count != 1:
-                    raise ValueError(f"無法建立客戶工作表「{target}」。")
-                sheet.attrib["name"] = target
-                existing_names.remove(original)
-                existing_names.add(target)
-        rels = ET.fromstring(files["xl/_rels/workbook.xml.rels"])
-        rel_map = {
-            relation.attrib["Id"]: relation.attrib["Target"]
-            for relation in rels
-            if relation.attrib.get("Type", "").endswith("/worksheet")
-        }
-        sheet_paths = {}
-        for sheet in workbook.findall(f".//{{{NS_MAIN}}}sheet"):
-            relation_id = sheet.attrib[f"{{{NS_REL}}}id"]
-            sheet_paths[sheet.attrib["name"]] = "xl/" + rel_map[relation_id].lstrip("/")
+            workbook_xml = files["xl/workbook.xml"].decode("utf-8")
+            workbook = ET.fromstring(workbook_xml)
+            sheet_renames = sheet_renames or {}
+            existing_names = {sheet.attrib["name"] for sheet in workbook.findall(f".//{{{NS_MAIN}}}sheet")}
+            for sheet in workbook.findall(f".//{{{NS_MAIN}}}sheet"):
+                original = sheet.attrib["name"]
+                target = sheet_renames.get(original)
+                if target and target not in existing_names:
+                    safe_original = re.escape(original)
+                    safe_target = (target.replace("&", "&amp;").replace('"', "&quot;")
+                                          .replace("<", "&lt;").replace(">", "&gt;"))
+                    workbook_xml, count = re.subn(
+                        rf'(<sheet\b[^>]*\bname="){safe_original}(")',
+                        rf'\g<1>{safe_target}\g<2>', workbook_xml, count=1,
+                    )
+                    if count != 1:
+                        raise ValueError(f"無法建立客戶工作表「{target}」。")
+                    sheet.attrib["name"] = target
+                    existing_names.remove(original)
+                    existing_names.add(target)
+            rels = ET.fromstring(files["xl/_rels/workbook.xml.rels"])
+            rel_map = {
+                relation.attrib["Id"]: relation.attrib["Target"]
+                for relation in rels
+                if relation.attrib.get("Type", "").endswith("/worksheet")
+            }
+            sheet_paths = {}
+            for sheet in workbook.findall(f".//{{{NS_MAIN}}}sheet"):
+                relation_id = sheet.attrib[f"{{{NS_REL}}}id"]
+                sheet_paths[sheet.attrib["name"]] = "xl/" + rel_map[relation_id].lstrip("/")
 
-        by_sheet: dict[str, list[tuple[int, dt.date, float, float]]] = {}
-        for customer, row, date, quantity, price in entries:
-            by_sheet.setdefault(customer, []).append((row, date, quantity, price))
-        for customer, rows in by_sheet.items():
-            if customer not in sheet_paths:
-                raise ValueError(f"範本內沒有客戶工作表「{customer}」")
-            path = sheet_paths[customer]
-            sheet_xml = files[path].decode("utf-8")
-            root = ET.fromstring(files[path])
-            sheet_data = root.find(f"{{{NS_MAIN}}}sheetData")
-            if sheet_data is None:
-                sheet_data = ET.SubElement(root, f"{{{NS_MAIN}}}sheetData")
-            for row, date, quantity, price in rows:
-                start_col = 9 + (date.day - 1) * 3
-                sheet_xml = self._set_number_xml(sheet_xml, row, start_col, quantity)
-                sheet_xml = self._set_number_xml(sheet_xml, row, start_col + 1, price)
-                continue
-                # 範本從 I 欄開始，每一日佔「數量／單價／金額」三欄。
-                start_col = 9 + (date.day - 1) * 3
-                self._ensure_empty(sheet_data, row, start_col)
-                self._ensure_empty(sheet_data, row, start_col + 1)
-                self._set_number(sheet_data, row, start_col, quantity)
-                self._set_number(sheet_data, row, start_col + 1, price)
-                self._set_formula(sheet_data, row, start_col + 2,
-                                  f"{col_name(start_col)}{row}*{col_name(start_col + 1)}{row}")
-            files[path] = sheet_xml.encode("utf-8")
+            by_sheet: dict[str, list[tuple[int, dt.date, float, float]]] = {}
+            for customer, row, date, quantity, price in entries:
+                by_sheet.setdefault(customer, []).append((row, date, quantity, price))
+            for customer, rows in by_sheet.items():
+                if customer not in sheet_paths:
+                    raise ValueError(f"範本內沒有客戶工作表「{customer}」")
+                path = sheet_paths[customer]
+                sheet_xml = files[path].decode("utf-8")
+                for row, date, quantity, price in rows:
+                    start_col = 9 + (date.day - 1) * 3
+                    sheet_xml = self._set_number_xml(sheet_xml, row, start_col, quantity)
+                    sheet_xml = self._set_number_xml(sheet_xml, row, start_col + 1, price)
+                files[path] = sheet_xml.encode("utf-8")
 
-        # 要求 Excel 開啟時重新算公式，避免舊的快取金額。
-        # Preserve the template's original workbook XML and namespace prefixes.
-        # Excel recalculates the inserted formulas when the workbook is opened.
-        files["xl/workbook.xml"] = self._force_recalculation_xml(workbook_xml).encode("utf-8")
-        temporary = self.output.with_suffix(".tmp.xlsx")
-        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as target:
-            for name, content in files.items():
-                target.writestr(name, content)
-        temporary.replace(self.output)
+            files["xl/workbook.xml"] = self._force_recalculation_xml(workbook_xml).encode("utf-8")
+            with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as target:
+                for name, content in files.items():
+                    target.writestr(name, content)
+            temporary.replace(self.output)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
 
     @staticmethod
     def _force_recalculation_xml(workbook_xml: str) -> str:
@@ -433,23 +428,41 @@ line 必須是單據左側印出的列號（1 到 17），不可自行編號。�
             data = json.loads(text)
         except json.JSONDecodeError as error:
             raise ValueError(f"辨識結果不是正確 JSON：{error.msg}") from error
+        if not isinstance(data, dict):
+            raise ValueError("辨識結果的最外層必須是 JSON 物件")
         problems, warnings, items = [], [], []
+        seen_lines: set[int] = set()
         if not data.get("customer"):
             problems.append("找不到客戶名稱")
         if not data.get("date"):
             problems.append("找不到日期")
-        for index, raw in enumerate(data.get("items", []), start=1):
+        raw_items = data.get("items", [])
+        if not isinstance(raw_items, list):
+            problems.append("品項格式不是清單")
+            raw_items = []
+        for index, raw in enumerate(raw_items, start=1):
+            raw_name = raw.get("name", "未命名品項") if isinstance(raw, dict) else "格式錯誤項目"
             try:
+                if not isinstance(raw, dict):
+                    raise ValueError("品項必須是 JSON 物件")
                 name = str(raw.get("name", "")).strip()
                 # 模型偶爾把空白列的序號（13、14…）誤當成品名，直接捨棄。
                 if not name or name.isdigit() or raw.get("quantity") is None or raw.get("price") is None:
                     raise ValueError
-                line = int(float(raw.get("line", index)))
+                line_value = float(raw.get("line", index))
+                if not line_value.is_integer():
+                    raise ValueError("列號必須是整數")
+                line = int(line_value)
                 if not 1 <= line <= 17:
                     raise ValueError("列號必須介於 1 到 17")
-                items.append(Item(name, LocalVisionReader._number(raw["quantity"]), LocalVisionReader._number(raw["price"]), line))
-            except (ValueError, TypeError) as error:
-                warnings.append(f"略過不完整項目：{raw.get('name', '未命名品項')}")
+                if line in seen_lines:
+                    raise ValueError("列號重複")
+                quantity = LocalVisionReader._number(raw["quantity"])
+                price = LocalVisionReader._number(raw["price"])
+                seen_lines.add(line)
+                items.append(Item(name, quantity, price, line))
+            except (ValueError, TypeError, AttributeError):
+                warnings.append(f"略過不完整項目：{raw_name}")
         if not items:
             problems.append("沒有可用的品項")
         return Receipt(filename, str(data.get("customer", "")), str(data.get("date", "")), items, problems, warnings)
@@ -457,16 +470,25 @@ line 必須是單據左側印出的列號（1 到 17），不可自行編號。�
     @staticmethod
     def _number(value: object) -> float:
         """接受模型常輸出的「3斤」、「半斤」、「3斤半」等值。"""
+        if isinstance(value, bool):
+            raise ValueError
         if isinstance(value, (int, float)):
-            return float(value)
+            number = float(value)
+            if not math.isfinite(number) or number <= 0:
+                raise ValueError
+            return number
         text = str(value).strip().replace(" ", "")
         if not text:
+            raise ValueError
+        if re.search(r"-\d", text):
             raise ValueError
         match = re.search(r"\d+(?:\.\d+)?", text)
         if match:
             number = float(match.group())
             if "半" in text and not text.startswith("半"):
                 number += 0.5
+            if not math.isfinite(number) or number <= 0:
+                raise ValueError
             return number
         if "半" in text:
             return 0.5
@@ -566,7 +588,7 @@ class BookkeepingApp:
         controls.pack(anchor="w", pady=14)
         ttk.Button(controls, text="檢查本機模型", command=self.check_local_model).pack(side="left")
         ttk.Button(controls, text="儲存設定", command=self.save_settings).pack(side="left", padx=8)
-        ttk.Label(self.settings_tab, text="免費離線模式：請先安裝 Ollama，再以 PowerShell 執行：ollama pull qwen2.5vl:3b。首次下載約 3.2 GB；照片不會上傳。", style="Hint.TLabel", wraplength=780).pack(anchor="w")
+        ttk.Label(self.settings_tab, text="免費離線模式：請先安裝 Ollama，再以 PowerShell 執行：ollama pull qwen2.5vl:7b。首次下載約 6 GB；照片不會上傳。", style="Hint.TLabel", wraplength=780).pack(anchor="w")
 
     def choose_path(self, key: str):
         if key == "photo_folder":
@@ -684,17 +706,6 @@ class BookkeepingApp:
         valid = sum(not item.problems for item in self.receipts)
         self.progress_text.set(f"讀取完成：{len(photos)} / {len(photos)}")
         messagebox.showinfo("讀取完成", f"共讀取 {len(self.receipts)} 張照片；{valid} 張可寫入，其他請查看結果與 log。")
-
-    def paste_manual(self):
-        popup = tk.Toplevel(self.root); popup.title("貼上人工資料"); popup.geometry("720x500")
-        ttk.Label(popup, text="請貼上單一張單據的 JSON。範例：{\"customer\":\"香草\",\"date\":\"8/8\",\"items\":[{\"name\":\"高麗菜\",\"quantity\":2,\"price\":70}]}", wraplength=680).pack(padx=12, pady=12)
-        box = tk.Text(popup, wrap="word"); box.pack(fill="both", expand=True, padx=12)
-        def submit():
-            try:
-                receipt = LocalVisionReader.from_json(box.get("1.0", "end"))
-                self.validate(receipt); self.receipts.append(receipt); self.refresh_receipts(); popup.destroy()
-            except Exception as error: messagebox.showerror("格式錯誤", str(error), parent=popup)
-        ttk.Button(popup, text="加入本次結果", command=submit).pack(pady=12)
 
     def validate(self, receipt: Receipt):
         if receipt.problems: return

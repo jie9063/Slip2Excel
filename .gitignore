@@ -1,0 +1,13 @@
+# Python runtime files
+__pycache__/
+*.py[cod]
+
+# User data and local settings
+TrainPhoto/
+logs/
+config.json
+*.xlsx
+
+# Temporary files created while writing Excel
+*.tmp.xlsx
+*.recalc.tmp.xlsx

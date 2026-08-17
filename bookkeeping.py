@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 import datetime as dt
+from io import BytesIO
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import os
 import queue
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import tkinter as tk
@@ -24,10 +26,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from xml.etree import ElementTree as ET
+from PIL import Image, ImageOps
+from version import VERSION
 
-ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config.json"
-LOG_DIR = ROOT / "logs"
+APP_NAME = "Slip2Excel"
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
+ICON_PATH = RESOURCE_ROOT / "assets" / "slip2excel-icon.ico"
+DATA_ROOT = (Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME) if getattr(sys, "frozen", False) else ROOT
+DATA_ROOT.mkdir(parents=True, exist_ok=True)
+CONFIG_PATH = DATA_ROOT / "config.json"
+LOG_DIR = DATA_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
     filename=LOG_DIR / "app.log", encoding="utf-8", level=logging.INFO,
@@ -46,6 +55,7 @@ DEFAULT_CONFIG = {
     "vision_provider": "ollama",
     "local_model": "qwen2.5vl:7b",
     "openai_model": "gpt-4o",
+    "onboarding_completed": False,
     "customers": [],
     "products": [],
 }
@@ -69,6 +79,24 @@ class Receipt:
     warnings: list[str] = field(default_factory=list)
 
 
+def is_customer_sheet_name(name: object) -> bool:
+    """Exclude template and summary sheets that must never receive receipt data."""
+    if not isinstance(name, str) or not name.strip():
+        return False
+    return not any(token in name for token in ("空白表單", "總表", "工作表"))
+
+
+def remove_template_placeholder_mappings(customers: object) -> list[dict]:
+    """Drop auto-created mappings for template/summary tabs, while preserving renamed tabs."""
+    if not isinstance(customers, list):
+        return []
+    return [
+        customer for customer in customers
+        if isinstance(customer, dict)
+        and (customer.get("template_sheet") or is_customer_sheet_name(customer.get("sheet")))
+    ]
+
+
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
         save_config(copy.deepcopy(DEFAULT_CONFIG))
@@ -90,7 +118,7 @@ def load_config() -> dict:
                 config["customers"] = [
                     {"sheet": name, "aliases": [name]}
                     for name in names
-                    if "空白" not in name and "總表" not in name and "工作表" not in name
+                    if is_customer_sheet_name(name)
                 ]
                 changed = True
             except (OSError, zipfile.BadZipFile, ET.ParseError):
@@ -98,7 +126,9 @@ def load_config() -> dict:
     # 已由實際單據驗證的店名別名，以及兩張範本預留頁的新客戶。
     known_aliases = {
         "纖活": ["織活"],
-        "大湳": ["八德大湳", "八德大滿"],
+        "大湳": ["八德大湳", "八德大滿", "八德大浦"],
+        "強尼中原": ["強尼中原寶號"],
+        "內壢": ["蛋白內壢寶號", "蛋白內壇"],
     }
     by_sheet = {customer["sheet"]: customer for customer in config["customers"]}
     for sheet, aliases in known_aliases.items():
@@ -115,6 +145,10 @@ def load_config() -> dict:
         if sheet not in by_sheet:
             config["customers"].append({"sheet": sheet, "template_sheet": template_sheet, "aliases": aliases})
             changed = True
+    cleaned_customers = remove_template_placeholder_mappings(config["customers"])
+    if len(cleaned_customers) != len(config["customers"]):
+        config["customers"] = cleaned_customers
+        changed = True
     if changed:
         save_config(config)
     return config
@@ -122,6 +156,60 @@ def load_config() -> dict:
 
 def save_config(config: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_template_sheet_names(path: Path) -> list[str]:
+    """Return the worksheet names from an .xlsx template without opening Excel."""
+    with zipfile.ZipFile(path) as archive:
+        root = ET.fromstring(archive.read("xl/workbook.xml"))
+    return [sheet.attrib["name"] for sheet in root.findall(f".//{{{NS_MAIN}}}sheet")]
+
+
+def merge_customer_mappings(existing: object, imported: object) -> tuple[list[dict], int]:
+    """Safely merge customer aliases, returning the merged list and imported count.
+
+    Only ``sheet``, ``template_sheet`` and ``aliases`` are accepted.  This keeps
+    old paths and any unrelated settings out of a user's current configuration.
+    """
+    merged: list[dict] = []
+    by_sheet: dict[str, dict] = {}
+
+    def add_entries(entries: object, count_imported: bool) -> int:
+        added = 0
+        if not isinstance(entries, list):
+            return added
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("sheet"), str):
+                continue
+            sheet = entry["sheet"].strip()
+            if not sheet:
+                continue
+            aliases = entry.get("aliases", [])
+            if not isinstance(aliases, list):
+                aliases = []
+            clean_aliases = [str(alias).strip() for alias in aliases if str(alias).strip()]
+            if sheet not in clean_aliases:
+                clean_aliases.insert(0, sheet)
+            target = by_sheet.get(sheet)
+            if target is None:
+                target = {"sheet": sheet, "aliases": []}
+                template_sheet = entry.get("template_sheet")
+                if isinstance(template_sheet, str) and template_sheet.strip():
+                    target["template_sheet"] = template_sheet.strip()
+                by_sheet[sheet] = target
+                merged.append(target)
+            elif not target.get("template_sheet") and isinstance(entry.get("template_sheet"), str):
+                target["template_sheet"] = entry["template_sheet"].strip()
+            before = len(target["aliases"])
+            for alias in clean_aliases:
+                if alias not in target["aliases"]:
+                    target["aliases"].append(alias)
+            if count_imported:
+                added += len(target["aliases"]) - before
+        return added
+
+    add_entries(existing, False)
+    return merged, add_entries(imported, True)
 
 
 def normalise(text: str) -> str:
@@ -155,6 +243,11 @@ def parse_date(value: str) -> dt.date:
     if len(parts) == 3:
         if parts[0] >= 100:
             year, month, day = parts
+        elif parts[0] > 31 and 1 <= parts[1] <= 12 and 1 <= parts[2] <= 31:
+            # OCR may join a printed form label to a handwritten date, for
+            # example reading "8/7" as "87/08/07". A value above 31 cannot
+            # be the month, so the final month/day pair is unambiguous.
+            year, month, day = today.year, parts[1], parts[2]
         elif parts[2] >= 100:
             month, day, year = parts
         else:
@@ -167,27 +260,96 @@ def parse_date(value: str) -> dt.date:
 
 def prepare_entries(receipts: list[Receipt]) -> tuple[list[tuple[str, int, dt.date, float, float]], int]:
     """Create Excel entries and ignore identical duplicate photos safely."""
-    slots: dict[tuple[str, int, dt.date], tuple[float, float]] = {}
+    # Excel has one column group for each day of the selected monthly template.
+    # The year/month are not part of its cell address, so they must not be part
+    # of the duplicate key either; otherwise an OCR year error could overwrite
+    # the exact same Excel cell without being detected.
+    slots: dict[tuple[str, int, int], tuple[dt.date, float, float]] = {}
     duplicates = 0
     for receipt in receipts:
         date = parse_date(receipt.date)
         for item in receipt.items:
             row = 3 + item.line
-            key = (receipt.customer, row, date)
+            key = (receipt.customer, row, date.day)
             value = (float(item.quantity), float(item.price))
             previous = slots.get(key)
             if previous is None:
-                slots[key] = value
-            elif previous == value:
+                slots[key] = (date, *value)
+            elif previous[1:] == value:
                 duplicates += 1
             else:
                 raise ValueError(
-                    f"資料衝突：{receipt.customer}、{date:%Y/%m/%d}、第 {item.line} 列有不同數量或單價。"
+                    f"資料衝突：{receipt.customer}、{date:%m/%d}、第 {item.line} 列有不同數量或單價。"
                     "請保留正確的照片後再匯出。"
                 )
-    entries = [(customer, row, date, quantity, price)
-               for (customer, row, date), (quantity, price) in slots.items()]
+    entries = [
+        (customer, row, date, quantity, price)
+        for (customer, row, _day), (date, quantity, price) in slots.items()
+    ]
     return entries, duplicates
+
+
+def classify_duplicate_and_conflicting_receipts(receipts: list[Receipt]) -> tuple[int, int]:
+    """Keep only the first receipt for each customer/day and flag every later one.
+
+    The accounting form has one position for a customer on each day.  The first
+    photo encountered owns that position; every following photo is held without
+    writing and identifies the retained photo for the user to compare.
+    """
+    grouped: dict[tuple[str, int], list[Receipt]] = {}
+    for receipt in receipts:
+        if receipt.problems:
+            continue
+        try:
+            date = parse_date(receipt.date)
+        except ValueError:
+            continue
+        grouped.setdefault((receipt.customer, date.day), []).append(receipt)
+
+    duplicate_photos = repeated_photos = 0
+    for (customer, day), group in grouped.items():
+        if len(group) < 2:
+            continue
+        original = group[0]
+        original_signature = (
+            tuple(sorted((item.line, float(item.quantity), float(item.price)) for item in original.items)),
+            tuple(original.warnings),
+        )
+        for later_receipt in group[1:]:
+            later_signature = (
+                tuple(sorted((item.line, float(item.quantity), float(item.price)) for item in later_receipt.items)),
+                tuple(later_receipt.warnings),
+            )
+            if later_signature == original_signature:
+                later_receipt.problems.append(
+                    f"重複單據：{customer}、日期 {day} 日已使用「{original.file}」；此照片未寫入 Excel。"
+                )
+                duplicate_photos += 1
+            else:
+                later_receipt.problems.append(
+                    f"同日重複單據：{customer}、日期 {day} 日已使用「{original.file}」；"
+                    "此照片內容不同，為避免覆蓋資料未寫入 Excel。"
+                )
+                repeated_photos += 1
+    return duplicate_photos, repeated_photos
+
+
+def assert_write_plan_complete(
+    receipts: list[Receipt], entries: list[tuple[str, int, dt.date, float, float]], duplicate_count: int,
+) -> int:
+    """Reject an export plan unless every approved item has one target cell."""
+    expected_entries = sum(len(receipt.items) for receipt in receipts)
+    if duplicate_count:
+        raise ValueError(
+            f"安全檢查發現 {duplicate_count} 筆重複的 Excel 寫入位置，已停止匯出。"
+            "請回到「問題紀錄」確認重複照片後再試。"
+        )
+    if len(entries) != expected_entries:
+        raise ValueError(
+            f"安全檢查失敗：預計寫入 {expected_entries} 筆資料，實際只建立 {len(entries)} 個 Excel 位置。"
+            "為避免漏寫，已停止匯出。"
+        )
+    return expected_entries
 
 
 class XlsxWriter:
@@ -196,12 +358,19 @@ class XlsxWriter:
     def __init__(self, template: Path, output: Path):
         self.template, self.output = template, output
 
-    def write(self, entries: list[tuple[str, int, dt.date, float, float]], sheet_renames: dict[str, str] | None = None) -> None:
+    def write(self, entries: list[tuple[str, int, dt.date, float, float]], sheet_renames: dict[str, str] | None = None) -> bool:
         if not self.template.exists():
             raise FileNotFoundError(f"找不到空白表單：{self.template}")
         self.output.parent.mkdir(parents=True, exist_ok=True)
         if self.template.resolve() == self.output.resolve():
             raise ValueError("完成檔不能與空白 Excel 表單設定為同一個檔案。")
+        # A later batch must retain the earlier batches.  Use the verified output
+        # as the base when it exists; otherwise create the first output from the
+        # selected blank form.  All writes still happen in a temporary file.
+        appending_to_existing_output = self.output.exists()
+        source_file = self.output if appending_to_existing_output else self.template
+        if appending_to_existing_output and (not source_file.is_file() or not zipfile.is_zipfile(source_file)):
+            raise ValueError("現有完成檔不是可讀取的 Excel 檔案；為保護資料，本次沒有寫入。")
         # 在同一資料夾先建立暫存檔，全部驗證與寫入成功後才取代完成檔。
         # 任何中途錯誤都不會破壞既有完成檔。
         with tempfile.NamedTemporaryFile(
@@ -210,7 +379,7 @@ class XlsxWriter:
         ) as handle:
             temporary = Path(handle.name)
         try:
-            shutil.copy2(self.template, temporary)
+            shutil.copy2(source_file, temporary)
             with zipfile.ZipFile(temporary, "r") as source:
                 files = {info.filename: source.read(info.filename) for info in source.infolist()}
 
@@ -247,6 +416,7 @@ class XlsxWriter:
                 relation_id = sheet.attrib[f"{{{NS_REL}}}id"]
                 sheet_paths[sheet.attrib["name"]] = "xl/" + rel_map[relation_id].lstrip("/")
 
+            self._assert_target_cells_empty(files, sheet_paths, entries)
             by_sheet: dict[str, list[tuple[int, dt.date, float, float]]] = {}
             for customer, row, date, quantity, price in entries:
                 by_sheet.setdefault(customer, []).append((row, date, quantity, price))
@@ -265,10 +435,108 @@ class XlsxWriter:
             with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as target:
                 for name, content in files.items():
                     target.writestr(name, content)
+            self._verify_written_entries(temporary, sheet_paths, entries)
             temporary.replace(self.output)
+            return appending_to_existing_output
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
+
+    @staticmethod
+    def _assert_target_cells_empty(
+        files: dict[str, bytes], sheet_paths: dict[str, str], entries: list[tuple[str, int, dt.date, float, float]],
+    ) -> None:
+        """Refuse a second receipt for a customer/day already present in the file."""
+        by_sheet: dict[str, set[dt.date]] = {}
+        for customer, _row, date, _quantity, _price in entries:
+            by_sheet.setdefault(customer, set()).add(date)
+        occupied: list[str] = []
+        for customer, dates in by_sheet.items():
+            path = sheet_paths.get(customer)
+            if not path:
+                # The later worksheet-existence check supplies the clearer error.
+                continue
+            root = ET.fromstring(files[path])
+            cells = {cell.attrib.get("r", ""): cell for cell in root.findall(f".//{{{NS_MAIN}}}c")}
+            for date in dates:
+                first_column = 9 + (date.day - 1) * 3
+                # Form rows 4 through 19 are the 16 writable item rows.  Scan
+                # all of them, not just this batch's item lines: a second photo
+                # for the same customer/date must never add to the first photo.
+                for row in range(4, 20):
+                    for column in (first_column, first_column + 1):
+                        address = f"{col_name(column)}{row}"
+                        cell = cells.get(address)
+                        if cell is None:
+                            continue
+                        value = cell.findtext(f"{{{NS_MAIN}}}v")
+                        has_formula = cell.find(f"{{{NS_MAIN}}}f") is not None
+                        try:
+                            is_blank_value = value is None or math.isclose(float(value), 0, rel_tol=0, abs_tol=1e-9)
+                        except (TypeError, ValueError):
+                            is_blank_value = False
+                        if has_formula or not is_blank_value:
+                            shown_value = value if value not in (None, "") else "公式"
+                            occupied.append(f"{customer}、{date:%m/%d}（已有資料於 {address}：{shown_value}）")
+                            break
+                    if occupied:
+                        break
+                if len(occupied) >= 5:
+                    break
+            if len(occupied) >= 5:
+                break
+        if occupied:
+            raise ValueError(
+                "安全檢查發現同一客戶、同一天已經寫入完成檔：" + "；".join(occupied)
+                + "。為避免重複單據，這一批完全沒有寫入 Excel。"
+            )
+
+    @staticmethod
+    def _verify_written_entries(
+        workbook_path: Path,
+        sheet_paths: dict[str, str],
+        entries: list[tuple[str, int, dt.date, float, float]],
+    ) -> None:
+        """Reopen the finished XLSX and verify every requested quantity and price.
+
+        This protects users from a misleading success message if an unusual Excel
+        template causes a cell write to be lost or redirected.
+        """
+        by_sheet: dict[str, list[tuple[int, dt.date, float, float]]] = {}
+        for customer, row, date, quantity, price in entries:
+            by_sheet.setdefault(customer, []).append((row, date, quantity, price))
+        problems: list[str] = []
+        with zipfile.ZipFile(workbook_path) as archive:
+            for customer, rows in by_sheet.items():
+                path = sheet_paths.get(customer)
+                if not path:
+                    problems.append(f"找不到工作表「{customer}」")
+                    continue
+                root = ET.fromstring(archive.read(path))
+                values = {
+                    cell.attrib.get("r", ""): cell.findtext(f"{{{NS_MAIN}}}v")
+                    for cell in root.findall(f".//{{{NS_MAIN}}}c")
+                }
+                for row, date, quantity, price in rows:
+                    first_column = 9 + (date.day - 1) * 3
+                    for column, expected in ((first_column, quantity), (first_column + 1, price)):
+                        address = f"{col_name(column)}{row}"
+                        actual = values.get(address)
+                        try:
+                            matches = actual is not None and math.isclose(float(actual), float(expected), rel_tol=0, abs_tol=1e-9)
+                        except (TypeError, ValueError):
+                            matches = False
+                        if not matches:
+                            problems.append(f"{customer}!{address} 預期 {expected:g}，實際 {actual or '空白'}")
+                            if len(problems) >= 5:
+                                break
+                    if len(problems) >= 5:
+                        break
+                if len(problems) >= 5:
+                    break
+        if problems:
+            detail = "；".join(problems)
+            raise ValueError(f"Excel 寫入驗證失敗：{detail}。原有完成檔未被覆蓋。")
 
     @staticmethod
     def _force_recalculation_xml(workbook_xml: str) -> str:
@@ -395,11 +663,12 @@ class LocalVisionReader:
             )
 
     def read(self, photo: Path) -> Receipt:
-        encoded = base64.b64encode(photo.read_bytes()).decode("ascii")
+        image_bytes, _mime_type = self._prepare_image(photo)
+        encoded = base64.b64encode(image_bytes).decode("ascii")
         prompt = """請辨識這張繁體中文手寫估價單。只輸出 JSON，不要 Markdown。
 表格從左到右依序是：品名、數量、單價、金額、備註。請讀取每一列「數量」和它右邊緊鄰的「單價」手寫欄位；金額欄通常是空白，不可拿來當單價。
 格式必須是：{"customer":"客戶或店名","date":"YYYY/MM/DD 或 MM/DD","items":[{"line":1,"name":"品名","quantity":"數量，可含斤/包等單位","price":"單價"}]}
-line 必須是單據左側印出的列號（1 到 17），不可自行編號。僅保留品名欄已有文字、且數量與單價皆實際填寫的列；空白列不可輸出。看不清楚請略過該列，不要猜。"""
+line 必須是單據左側印出的列號（1 到 16），不可自行編號。第 17 列以後是表單的小計或總計，不可輸出。僅保留品名欄已有文字、且數量與單價皆實際填寫的列；空白列不可輸出。看不清楚請略過該列，不要猜。"""
         body = {
             "model": self.model,
             "stream": False,
@@ -426,6 +695,29 @@ line 必須是單據左側印出的列號（1 到 17），不可自行編號。�
             if last_text and not re.fullmatch(r"[@#*\s]+", last_text):
                 return self.from_json(last_text, photo.name)
         raise ValueError("本機模型未能讀取此張單據（回覆空白或亂碼）；請重新拍攝清晰照片後再試。")
+
+    @staticmethod
+    def _prepare_image(photo: Path) -> tuple[bytes, str]:
+        """Return a model-ready image without ever changing the source photo."""
+        original = photo.read_bytes()
+        mime_type = mimetypes.guess_type(photo.name)[0] or "image/jpeg"
+        try:
+            with Image.open(photo) as source:
+                image = ImageOps.exif_transpose(source)
+                if image.width <= image.height:
+                    return original, mime_type
+                # The supported estimate form is portrait. Gallery exports can
+                # contain the same form as landscape pixels without EXIF data.
+                image = image.rotate(90, expand=True)
+                if image.mode not in {"RGB", "L"}:
+                    image = image.convert("RGB")
+                buffer = BytesIO()
+                image.save(buffer, format="JPEG", quality=95)
+                logging.info("已將橫向單據轉正後辨識：%s", photo.name)
+                return buffer.getvalue(), "image/jpeg"
+        except (OSError, ValueError):
+            logging.warning("無法轉正圖片，將使用原始檔辨識：%s", photo.name)
+            return original, mime_type
 
     @staticmethod
     def from_json(text: str, filename: str = "手動輸入") -> Receipt:
@@ -460,8 +752,8 @@ line 必須是單據左側印出的列號（1 到 17），不可自行編號。�
                 if not line_value.is_integer():
                     raise ValueError("列號必須是整數")
                 line = int(line_value)
-                if not 1 <= line <= 17:
-                    raise ValueError("列號必須介於 1 到 17")
+                if not 1 <= line <= 16:
+                    raise ValueError("列號必須介於 1 到 16；小計與總計列不可寫入")
                 if line in seen_lines:
                     raise ValueError("列號重複")
                 quantity = LocalVisionReader._number(raw["quantity"])
@@ -512,7 +804,7 @@ class OpenAIVisionReader(LocalVisionReader):
     PROMPT = (
         "Read this handwritten accounting form. Return its customer name, date, and "
         "each filled item line's quantity and unit price. The item name is optional. "
-        "Use the line number printed on the form (1 through 17). Do not invent values."
+        "Use the line number printed on the form (1 through 16). Rows 17 and later are totals; never return them. Do not invent values."
     )
     RESPONSE_SCHEMA = {
         "type": "object",
@@ -567,8 +859,8 @@ class OpenAIVisionReader(LocalVisionReader):
         )
 
     def read(self, photo: Path) -> Receipt:
-        mime_type = mimetypes.guess_type(photo.name)[0] or "image/jpeg"
-        encoded = base64.b64encode(photo.read_bytes()).decode("ascii")
+        image_bytes, mime_type = self._prepare_image(photo)
+        encoded = base64.b64encode(image_bytes).decode("ascii")
         body = {
             "model": self.model,
             "input": [{
@@ -630,13 +922,31 @@ class BookkeepingApp:
         self.read_events: queue.Queue = queue.Queue()
         self.cancel_reading_event = threading.Event()
         self.root = tk.Tk()
-        self.root.title("Slip2Excel")
+        self.root.title(f"Slip2Excel v{VERSION}")
+        if ICON_PATH.exists():
+            self.root.iconbitmap(default=str(ICON_PATH))
         self.root.geometry("1050x720")
         self.root.minsize(900, 620)
         self._build()
+        self.root.after(250, self._show_first_run_guide)
 
     def run(self):
         self.root.mainloop()
+
+    def _show_first_run_guide(self):
+        """Show a short, non-technical setup guide once for each user profile."""
+        if self.config.get("onboarding_completed"):
+            return
+        messagebox.showinfo(
+            "首次使用｜三個步驟完成設定",
+            "1. 點上方「設定」。\n"
+            "2. 依序選擇「原始照片資料夾」與「空白 Excel 表單」。\n"
+            "3. 按「儲存設定」，再回到「讀取與寫入」按「讀取照片資料夾」。\n\n"
+            "選擇空白 Excel 表單時，程式會自動建立客戶對照。\n"
+            "照片讀完並確認結果後，按「寫入 Excel」即可完成。",
+        )
+        self.config["onboarding_completed"] = True
+        save_config(self.config)
 
     def _build(self):
         self.root.configure(background="#F1F5F9")
@@ -738,7 +1048,7 @@ class BookkeepingApp:
         self.issues_tree.bind("<<TreeviewSelect>>", self.show_issue_detail)
         ttk.Label(self.mapping_tab, text="這裡只顯示讀取失敗或有不完整項目的照片。點選照片可查看原因；完整可寫入的照片不會顯示。", style="Hint.TLabel").pack(anchor="w", pady=(8, 0))
 
-    def _build_settings(self):
+    def _build_settings_legacy(self):
         self.settings_vars = {
             key: tk.StringVar(value=str(self.config[key]))
             for key in ("photo_folder", "template_file", "output_file", "vision_provider", "local_model", "openai_model")
@@ -771,6 +1081,76 @@ class BookkeepingApp:
         ttk.Button(controls, text="儲存設定", command=self.save_settings, style="Primary.TButton").pack(side="left", padx=8)
         ttk.Label(self.settings_tab, text="免費離線模式：請先安裝 Ollama，再以 PowerShell 執行：ollama pull qwen2.5vl:7b。首次下載約 6 GB；照片不會上傳。", style="Hint.TLabel", wraplength=780).pack(anchor="w")
 
+    def _build_settings(self):
+        self.settings_vars = {
+            key: tk.StringVar(value=str(self.config[key]))
+            for key in ("photo_folder", "template_file", "output_file", "vision_provider", "local_model", "openai_model")
+        }
+        self.openai_api_key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
+        self.model_choice_var = tk.StringVar(value=self._selected_model_label())
+
+        grid = ttk.Frame(self.settings_tab, padding=16, style="Surface.TFrame")
+        grid.pack(fill="x")
+        ttk.Label(grid, text="辨識模型", style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=7)
+        model_box = ttk.Combobox(
+            grid, textvariable=self.model_choice_var, values=self._model_choice_labels(),
+            state="readonly", width=75,
+        )
+        model_box.grid(row=0, column=1, sticky="ew", padx=8)
+        model_box.bind("<<ComboboxSelected>>", self._on_model_choice)
+        ttk.Label(grid, text="選擇後才顯示需要的設定", style="Surface.TLabel").grid(row=0, column=2, sticky="w")
+
+        self.openai_key_label = ttk.Label(grid, text="OpenAI API 金鑰", style="Surface.TLabel")
+        self.openai_key_input = ttk.Entry(grid, textvariable=self.openai_api_key_var, show="●", width=75)
+        self.openai_key_hint = ttk.Label(grid, text="只在本次開啟程式期間使用，不會儲存", style="Surface.TLabel")
+
+        fields = [
+            ("photo_folder", "原始照片資料夾"),
+            ("template_file", "空白 Excel 表單"),
+            ("output_file", "完成 Excel 儲存位置"),
+        ]
+        for row, (key, label) in enumerate(fields, start=2):
+            ttk.Label(grid, text=label, style="Surface.TLabel").grid(row=row, column=0, sticky="w", pady=7)
+            ttk.Entry(grid, textvariable=self.settings_vars[key], width=75).grid(row=row, column=1, sticky="ew", padx=8)
+            ttk.Button(grid, text="選擇", command=lambda item=key: self.choose_path(item), style="Secondary.TButton").grid(row=row, column=2)
+        grid.columnconfigure(1, weight=1)
+        self._update_model_settings()
+
+        controls = ttk.Frame(self.settings_tab, style="App.TFrame")
+        controls.pack(anchor="w", pady=14)
+        ttk.Button(controls, text="檢查目前模型", command=self.check_local_model, style="Secondary.TButton").pack(side="left")
+        ttk.Button(controls, text="儲存設定", command=self.save_settings, style="Primary.TButton").pack(side="left", padx=8)
+        ttk.Label(
+            self.settings_tab,
+            text="本機 Ollama 不上傳照片且免費；選擇 OpenAI 時，照片會送往 OpenAI API 並使用你的 API 額度。",
+            style="Hint.TLabel", wraplength=780,
+        ).pack(anchor="w")
+
+    def _model_choice_labels(self) -> tuple[str, str]:
+        return (
+            f"Ollama（免費離線）｜{self.settings_vars['local_model'].get()}",
+            f"OpenAI API｜{self.settings_vars['openai_model'].get()}",
+        )
+
+    def _selected_model_label(self) -> str:
+        labels = self._model_choice_labels()
+        return labels[1] if self.settings_vars["vision_provider"].get() == "openai" else labels[0]
+
+    def _on_model_choice(self, _event=None):
+        self._update_model_settings()
+
+    def _update_model_settings(self):
+        is_openai = self.model_choice_var.get().startswith("OpenAI API")
+        self.settings_vars["vision_provider"].set("openai" if is_openai else "ollama")
+        if is_openai:
+            self.openai_key_label.grid(row=1, column=0, sticky="w", pady=7)
+            self.openai_key_input.grid(row=1, column=1, sticky="ew", padx=8)
+            self.openai_key_hint.grid(row=1, column=2, sticky="w")
+        else:
+            self.openai_key_label.grid_remove()
+            self.openai_key_input.grid_remove()
+            self.openai_key_hint.grid_remove()
+
     def choose_path(self, key: str):
         if key == "photo_folder":
             selected = filedialog.askdirectory(initialdir=self.settings_vars[key].get() or str(ROOT))
@@ -780,11 +1160,38 @@ class BookkeepingApp:
             selected = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel 表單", "*.xlsx")])
         if selected:
             self.settings_vars[key].set(selected)
+            if key == "template_file":
+                self._add_template_customers(Path(selected), show_result=True)
 
     def save_settings(self):
         for key, var in self.settings_vars.items():
             self.config[key] = var.get().strip()
+        template = Path(self.config["template_file"])
+        if template.exists():
+            self._add_template_customers(template, show_result=False)
         save_config(self.config)
+
+    def _add_template_customers(self, template: Path, show_result: bool) -> int:
+        """Create exact-name mappings for a newly selected Excel template."""
+        try:
+            sheet_names = read_template_sheet_names(template)
+        except (OSError, zipfile.BadZipFile, ET.ParseError, KeyError) as error:
+            logging.warning("Unable to read Excel template %s: %s", template, error)
+            if show_result:
+                messagebox.showwarning("無法建立客戶對照", "無法讀取這份 Excel 表單，請確認檔案可正常開啟。")
+            return 0
+        mappings = [{"sheet": name, "aliases": [name]} for name in sheet_names if is_customer_sheet_name(name)]
+        existing = remove_template_placeholder_mappings(self.config.get("customers", []))
+        removed = len(self.config.get("customers", [])) - len(existing)
+        merged, created = merge_customer_mappings(existing, mappings)
+        if created or removed:
+            self.config["customers"] = merged
+            save_config(self.config)
+            if show_result:
+                messagebox.showinfo("已建立客戶對照", f"已從空白 Excel 表單建立 {created} 個客戶對照。")
+        elif show_result:
+            messagebox.showinfo("客戶對照已存在", "這份空白 Excel 表單的客戶對照已建立。")
+        return created
 
     def check_local_model(self):
         """Check the provider currently selected in Settings."""
@@ -929,10 +1336,17 @@ class BookkeepingApp:
                 finished = True
             elif kind == "finished":
                 _, completed, total = event
+                duplicates, repeated = classify_duplicate_and_conflicting_receipts(self.receipts)
                 valid = sum(not item.problems for item in self.receipts)
                 self.progress_var.set(completed)
                 self.progress_text.set(f"讀取完成：{completed} / {total}")
-                self._finish_reading("讀取完成", f"共讀取 {completed} 張照片；{valid} 張可寫入。\n\n有問題的照片請到「辨識問題」查看。")
+                notes = [f"共讀取 {completed} 張照片；{valid} 張可寫入。"]
+                if duplicates:
+                    notes.append(f"已略過 {duplicates} 張完全相同的重複照片。")
+                if repeated:
+                    notes.append(f"有 {repeated} 張同一客戶同日的照片未寫入；已在問題紀錄列出保留的照片。")
+                notes.append("有問題的照片請到「問題紀錄」查看。")
+                self._finish_reading("讀取完成", "\n".join(notes))
                 finished = True
         if self.reading and not finished:
             self.root.after(80, self._poll_read_events)
@@ -953,6 +1367,7 @@ class BookkeepingApp:
             parse_date(receipt.date)
         except ValueError as error:
             receipt.problems.append(str(error))
+            return
 
     def match_customer(self, name: str) -> str | None:
         target = normalise(name)
@@ -993,7 +1408,7 @@ class BookkeepingApp:
             self.issues_tree.insert(
                 "", "end", iid=str(index),
                 values=(receipt.file, receipt.customer or "-", receipt.date or "-", issue_type, reason),
-                tags=("failed",) if receipt.problems else ("incomplete",),
+                tags=("incomplete",) if issue_type.startswith("資料不完整") else ("failed",),
             )
         self.issues_tree.tag_configure("failed", foreground="#b00020")
         self.issues_tree.tag_configure("incomplete", foreground="#9a6700")
@@ -1024,7 +1439,7 @@ class BookkeepingApp:
             if receipt.problems:
                 status = "；".join(receipt.problems)
             elif receipt.warnings:
-                status = "可寫入（" + "；".join(receipt.warnings) + "）"
+                status = "可寫入（略過不完整品項；已記錄）"
             else:
                 status = "可寫入"
             self.receipt_tree.insert("", "end", iid=str(index), values=(receipt.file, receipt.customer, receipt.date, len(receipt.items), status), tags=("bad",) if receipt.problems else ())
@@ -1062,21 +1477,29 @@ class BookkeepingApp:
         duplicate_count = 0
         try:
             entries, duplicate_count = prepare_entries(valid)
-            for receipt in []:
-                date = parse_date(receipt.date)
-                for item in receipt.items:
-                    # 單據的第 1 列對應 Excel 第 4 列，因此無須辨識或填入菜名。
-                    entries.append((receipt.customer, 3 + item.line, date, item.quantity, item.price))
+            expected_entry_count = assert_write_plan_complete(valid, entries, duplicate_count)
             sheet_renames = {
                 customer["template_sheet"]: customer["sheet"]
                 for customer in self.config["customers"]
                 if customer.get("template_sheet")
             }
-            XlsxWriter(Path(self.config["template_file"]), Path(self.config["output_file"])).write(entries, sheet_renames)
+            appended = XlsxWriter(Path(self.config["template_file"]), Path(self.config["output_file"])).write(entries, sheet_renames)
         except Exception as error:
             logging.exception("Excel 寫入失敗")
             messagebox.showerror("寫入失敗", str(error)); return
         skipped = len(self.receipts) - len(valid)
-        warning_count = sum(len(receipt.warnings) for receipt in valid)
-        logging.info("成功寫入 %d 張照片、%d 筆資料；略過 %d 張、略過 %d 個不完整項目", len(valid), len(entries), skipped, warning_count)
-        messagebox.showinfo("完成", f"已寫入 {len(valid)} 張照片、{len(entries)} 筆資料。\n\n完成檔：\n{self.config['output_file']}\n\n略過 {skipped} 張有問題的照片，原因已顯示並記錄於 logs/app.log。")
+        warning_count = sum(len(receipt.warnings) for receipt in self.receipts)
+        logging.info(
+            "已安全寫入 %d 張照片、驗證 %d/%d 個 Excel 資料位置；擋下 %d 張、%d 個不完整項目",
+            len(valid), len(entries), expected_entry_count, skipped, warning_count,
+        )
+        notes = [
+            "已接續既有完成檔寫入本批資料。" if appended else "已從空白 Excel 表單建立完成檔。",
+            f"已安全寫入 {len(valid)} 張照片。",
+            f"已回讀驗證 {len(entries)} / {expected_entry_count} 個 Excel 資料位置。",
+            f"已擋下 {skipped} 張重複或有問題的照片，沒有寫入 Excel。",
+        ]
+        if warning_count:
+            notes.append(f"已略過並記錄 {warning_count} 個無法確認的品項；其餘已確認品項已寫入。")
+        notes.append("請到「問題紀錄」查看略過品項與未寫入照片的原因。")
+        messagebox.showinfo("安全寫入完成", "\n".join(notes) + f"\n\n完成檔：\n{self.config['output_file']}")

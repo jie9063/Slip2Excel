@@ -7,7 +7,13 @@ TrainPhoto/
 logs/
 config.json
 *.xlsx
-
+TestData/
 # Temporary files created while writing Excel
 *.tmp.xlsx
 *.recalc.tmp.xlsx
+
+# Packaging output
+build/
+dist/
+release/
+*.spec
